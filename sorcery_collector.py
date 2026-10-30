@@ -1,10 +1,22 @@
 """Add Sorcery TCG cards to your sorcerytcg.com collection from a text file.
 
 Usage:
+    python sorcery_collector.py FILE --set SET [--foil] [-d | --dry-run] [--cleanup]
+
+    FILE              text file with one (partial) card name per line (format below)
+    --set SET         set to add the cards from, by name or code, e.g. beta, alpha,
+                      "arthurian legends", gothic. Required.
+    --foil            add the foil printings instead of the non-foil ones
+    -d, --dry-run     only match the cards and show what would be added;
+                      no browser is opened and nothing is added
+    --cleanup         delete lines from FILE once their cards have been added
+                      successfully, so a rerun only retries the failures
+
+Examples:
     python sorcery_collector.py cards.txt --set beta
     python sorcery_collector.py cards.txt --set "arthurian" --foil
-    python sorcery_collector.py cards.txt --set alpha --dry-run
-    python sorcery_collector.py cards.txt --set beta --cleanup   # remove added lines from the file
+    python sorcery_collector.py cards.txt --set alpha -d
+    python sorcery_collector.py cards.txt --set beta --cleanup
 
 Card file format (one card per line, partial names are fine):
     scarecrow
@@ -14,11 +26,18 @@ Card file format (one card per line, partial names are fine):
 Blank lines and lines starting with '#' are ignored. For a card whose name
 starts with a number, give the count explicitly: "1 13 treasures".
 
-Rows that end up "Not found" or "Skipped" can be clicked in the window to
-edit the text and retry them.
+All lines are matched first and listed in a window for review; nothing is
+added until you click "Add ... to collection". Double-click a row to change
+its quantity, fix a typo or pick a different printing. Rows that fail can be
+fixed the same way and added with another click.
 
 On the first run a browser window opens; log in to sorcerytcg.com there.
 The login is kept in ./browser_profile for later runs.
+
+Requirements (checked at startup; anything missing is reported with how to get it):
+    Python 3.10+ with tkinter
+    pip install playwright
+    playwright install firefox     (not needed for --dry-run)
 """
 
 import argparse
@@ -28,11 +47,20 @@ import re
 import sys
 import threading
 import time
-import tkinter as tk
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import simpledialog, ttk
+
+if sys.version_info < (3, 10):
+    raise SystemExit(f"Python 3.10 or newer is needed; this is Python {sys.version.split()[0]}.\n"
+                     "Get a newer one from https://www.python.org/downloads/")
+try:
+    import tkinter as tk
+    from tkinter import simpledialog, ttk
+except ImportError:
+    raise SystemExit("tkinter, which draws the importer window, is missing from this Python.\n"
+                     "Reinstall Python from https://www.python.org/downloads/ with "
+                     "\"tcl/tk and IDLE\" ticked.")
 
 HERE = Path(__file__).resolve().parent
 SITE = "https://sorcerytcg.com"
@@ -72,9 +100,9 @@ class Entry:
     chosen: Printing | None = None
 
 
-def load_cards(refresh=False):
+def load_cards():
     fresh = CARDS_CACHE.exists() and time.time() - CARDS_CACHE.stat().st_mtime < CACHE_MAX_AGE
-    if fresh and not refresh:
+    if fresh:
         return json.loads(CARDS_CACHE.read_text(encoding="utf-8"))
     try:
         req = urllib.request.Request(CARDS_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -266,6 +294,26 @@ class SiteClient:
             time.sleep(2)
 
 
+def check_browser():
+    """Exit with install instructions if Playwright or its Firefox is missing."""
+    python = f'"{sys.executable}"'
+    install_firefox = f"    {python} -m playwright install firefox"
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise SystemExit("The Playwright package, which drives Firefox, is not installed. Install it with:\n"
+                         f"    {python} -m pip install playwright\n{install_firefox}")
+    try:
+        with sync_playwright() as pw:
+            firefox = Path(pw.firefox.executable_path)
+    except Exception as e:
+        raise SystemExit(f"Playwright is installed but could not start ({e}). Reinstall it with:\n"
+                         f"    {python} -m pip install --force-reinstall playwright\n{install_firefox}")
+    if not firefox.exists():
+        raise SystemExit("Playwright's Firefox is not installed (a normal Firefox install is not used). "
+                         f"Install it with:\n{install_firefox}")
+
+
 def browser_worker(jobs, ui, probe_card_id):
     try:
         from playwright.sync_api import sync_playwright
@@ -280,8 +328,8 @@ def browser_worker(jobs, ui, probe_card_id):
             )
             client = SiteClient(context)
             client.wait_for_login(probe_card_id, ui.browser_status)
-            ui.browser_status("Logged in — adding cards")
-            # Runs until the window is closed, so edited rows can be retried.
+            ui.logged_in()
+            # Runs until the window is closed, so cards can be added in several rounds.
             while (job := jobs.get()) is not None:
                 idx, printing, qty = job
                 try:
@@ -291,13 +339,10 @@ def browser_worker(jobs, ui, probe_card_id):
                 except Exception as e:
                     ui.entry_status(idx, f"Error: {e}", "error")
                 if jobs.empty():
-                    ui.browser_status("All queued cards processed — click a red row to edit and "
-                                      "retry it, or close the window when done")
                     ui.done()
             context.close()
     except Exception as e:
-        ui.browser_status(f"Browser error: {e}")
-        ui.done()
+        ui.browser_failed(f"Browser error: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -356,10 +401,16 @@ class App:
         self.card_file = card_file
         self.jobs = queue.Queue()
         self.ui_queue = queue.Queue()
+        self.browser_ready = False
+        self.browser_dead = False
+        self.adding = False
 
         root.title("Sorcery collection importer")
-        root.geometry("980x520")
-        ttk.Label(root, text=title, padding=(10, 8), font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        root.geometry("980x560")
+        ttk.Label(root, text=title, padding=(10, 8, 10, 0), font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(root, padding=(10, 2, 10, 8),
+                  text="Double-click a row to change its quantity, fix the name or pick a different "
+                       "printing.").pack(anchor="w")
 
         frame = ttk.Frame(root)
         frame.pack(fill="both", expand=True, padx=10)
@@ -375,22 +426,48 @@ class App:
         self.tree.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
         for tag, color in [("added", "#1b7f3b"), ("error", "#b3261e"), ("missing", "#b3261e"),
-                           ("skipped", "#8a6d00")]:
+                           ("skipped", "#8a6d00"), ("queued", "#666666")]:
             self.tree.tag_configure(tag, foreground=color)
         for i, e in enumerate(entries):
             self.tree.insert("", "end", iid=str(i), values=(e.line_no, e.qty, e.partial, "", "Pending"))
-        self.tree.bind("<ButtonRelease-1>", self.on_click)
+        self.tree.bind("<Double-1>", self.on_double_click)
 
+        bottom = ttk.Frame(root, padding=(10, 8))
+        bottom.pack(fill="x")
+        self.add_button = ttk.Button(bottom, command=self.add_cards, state="disabled",
+                                     text="Add cards to collection")
+        if not dry_run:
+            self.add_button.pack(side="right", padx=(10, 0), ipadx=8, ipady=4)
         self.status_var = tk.StringVar(value="Dry run — nothing will be added" if dry_run else "Starting browser…")
-        ttk.Label(root, textvariable=self.status_var, padding=(10, 8, 10, 0)).pack(anchor="w")
+        ttk.Label(bottom, textvariable=self.status_var, wraplength=760).pack(anchor="w")
         self.summary_var = tk.StringVar()
-        ttk.Label(root, textvariable=self.summary_var, padding=(10, 2, 10, 8)).pack(anchor="w")
+        ttk.Label(bottom, textvariable=self.summary_var).pack(anchor="w")
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.pump)
 
     # Thread-safe hooks used by the worker.
     def browser_status(self, text):
         self.ui_queue.put(lambda: self.status_var.set(text))
+
+    def logged_in(self):
+        self.ui_queue.put(self._logged_in)
+
+    def _logged_in(self):
+        self.browser_ready = True
+        self.status_var.set("Logged in — adding cards…" if self.adding else
+                            "Logged in. Check the list, then click the Add button.")
+
+    def browser_failed(self, text):
+        self.ui_queue.put(lambda: self._browser_failed(text))
+
+    def _browser_failed(self, text):
+        self.browser_ready = False
+        self.browser_dead = True
+        self.adding = False
+        for i in self.rows_tagged("queued"):
+            self.set_row(i, status="Not added — browser stopped", tag="error")
+        self.status_var.set(f"{text} — restart the importer to add cards.")
+        self.refresh_summary()
 
     def entry_status(self, idx, text, tag=""):
         self.ui_queue.put(lambda: self.set_row(idx, status=self.cleanup(idx, text, tag), tag=tag))
@@ -406,7 +483,16 @@ class App:
             return f"{status} · could not update file: {e}"
 
     def done(self):
-        self.ui_queue.put(self.refresh_summary)
+        self.ui_queue.put(self._done)
+
+    def _done(self):
+        self.adding = False
+        if self.rows_tagged("error", "missing", "skipped"):
+            self.status_var.set("Finished adding. Double-click a red or yellow row to fix it and click "
+                                "Add again, or close the window when done.")
+        else:
+            self.status_var.set("Finished adding — close the window when done.")
+        self.refresh_summary()
 
     def pump(self):
         while not self.ui_queue.empty():
@@ -425,6 +511,10 @@ class App:
             values[4] = status
         self.tree.item(str(idx), values=values, tags=(tag,) if tag else ())
         self.tree.see(str(idx))
+        self.refresh_summary()
+
+    def rows_tagged(self, *tags):
+        return [i for i in range(len(self.entries)) if set(tags) & set(self.tree.item(str(i), "tags"))]
 
     def resolve_all(self):
         try:
@@ -435,13 +525,12 @@ class App:
     def _resolve_all(self):
         for i in range(len(self.entries)):
             self.resolve_entry(i)
-        self.refresh_summary()
 
     def resolve_entry(self, i):
         entry = self.entries[i]
         entry.chosen = None
         if not entry.candidates:
-            self.set_row(i, card="", status="Not found — click to edit", tag="missing")
+            self.set_row(i, card="", status="Not found — double-click to edit", tag="missing")
             return
         if len(entry.candidates) == 1:
             entry.chosen = entry.candidates[0]
@@ -451,16 +540,26 @@ class App:
             self.root.wait_window(dialog)
             entry.chosen = dialog.choice
         if entry.chosen is None:
-            self.set_row(i, card="", status="Skipped — click to edit", tag="skipped")
-        elif self.dry_run:
-            self.set_row(i, card=entry.chosen.label(), status=f"Would add {entry.qty}")
+            self.set_row(i, card="", status="Skipped — double-click to edit", tag="skipped")
         else:
-            self.set_row(i, card=entry.chosen.label(), status="Queued")
-            self.jobs.put((i, entry.chosen, entry.qty))
+            self.set_row(i, card=entry.chosen.label(), tag="ready",
+                         status=f"{'Would add' if self.dry_run else 'Ready to add'} {entry.qty}")
 
-    def on_click(self, event):
+    def add_cards(self):
+        rows = self.rows_tagged("ready", "error")
+        if not rows:
+            return
+        self.adding = True
+        for i in rows:
+            entry = self.entries[i]
+            self.set_row(i, status="Queued", tag="queued")
+            self.jobs.put((i, entry.chosen, entry.qty))
+        self.status_var.set("Adding cards…" if self.browser_ready else
+                            "The cards will be added once you are logged in in the Firefox window…")
+
+    def on_double_click(self, event):
         row = self.tree.identify_row(event.y)
-        if not row or not {"missing", "skipped"} & set(self.tree.item(row, "tags")):
+        if not row or {"queued", "added"} & set(self.tree.item(row, "tags")):
             return
         i = int(row)
         entry = self.entries[i]
@@ -476,15 +575,19 @@ class App:
         entry.candidates = self.match(entry.partial)
         self.set_row(i, qty=entry.qty, partial=entry.partial)
         self.resolve_entry(i)
-        self.refresh_summary()
 
     def refresh_summary(self):
         counts = {}
         for i in range(len(self.entries)):
             tags = self.tree.item(str(i), "tags")
-            key = tags[0] if tags else ("to add" if self.dry_run else "pending")
+            key = tags[0] if tags else "pending"
             counts[key] = counts.get(key, 0) + 1
         self.summary_var.set(", ".join(f"{n} {k}" for k, n in counts.items()))
+        copies = sum(self.entries[i].qty for i in self.rows_tagged("ready", "error"))
+        self.add_button.configure(
+            text=f"Add {copies} card{'' if copies == 1 else 's'} to collection" if copies
+            else "Add cards to collection",
+            state="normal" if copies and not self.browser_dead else "disabled")
 
     def close(self):
         self.jobs.put(None)
@@ -496,13 +599,14 @@ def main():
     ap.add_argument("file", help="text file with one (partial) card name per line")
     ap.add_argument("--set", required=True, help="set name or code, e.g. beta, alpha, 'arthurian legends', gothic")
     ap.add_argument("--foil", action="store_true", help="add the foil printings (default: non-foil)")
-    ap.add_argument("--dry-run", action="store_true", help="only show what would be added; no browser")
-    ap.add_argument("--refresh-cards", action="store_true", help="re-download the card list")
+    ap.add_argument("-d", "--dry-run", action="store_true", help="only show what would be added; no browser")
     ap.add_argument("--cleanup", action="store_true",
                     help="delete lines from the card file once they have been added successfully")
     args = ap.parse_args()
+    if not args.dry_run:
+        check_browser()
 
-    cards = load_cards(args.refresh_cards)
+    cards = load_cards()
     set_name, set_code = resolve_set(cards, args.set)
     finish = "Foil" if args.foil else "Standard"
     printings = build_printings(cards, set_code, finish)
