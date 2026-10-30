@@ -1,0 +1,5 @@
+browser_profile/
+__pycache__/
+cards_cache.json
+cards.txt
+design_doc.txt
