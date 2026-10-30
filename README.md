@@ -1,6 +1,20 @@
 this program lets you add cards very quickly to the sorcerytcg.com/collection using firefox.
 when starting the program first time you may be prompted to log in, but afterwards it should log in directly, as it maintains a cookie.
+its a python script, so you need to start it as you do python programs on your system.
+on linux it will usually be
+```
+python3 [command]
+```
 
+while on windows its usually
+```
+.\[command]
+```
+python must be installed obviously and the python library playwright.
+```
+pip install playwright
+python -m playwright install firefox
+```
 
 
 ```
